@@ -59,7 +59,6 @@
 
 這個外掛需要以下 Python 函式庫：
 
-*   `thonny>=4.0.0`
 *   `requests>=2.20.0`
 *   `markdown-it-py>=3.0.0`
 
