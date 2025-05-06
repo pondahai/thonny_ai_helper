@@ -6,7 +6,7 @@
 
 一個為 [Thonny IDE](https://thonny.org/) 設計的 AI 程式設計助手外掛 💡，旨在幫助您編寫、解釋和除錯程式碼。
 
-![AI Assistant Screenshot](placeholder.png)  <!-- 最好替換成您的外掛截圖 -->
+![螢幕擷取畫面 2025-05-06 110739](https://github.com/user-attachments/assets/aa0b9af8-cbab-44ad-ab3e-7335c5065945)
 
 ## ✨ 功能特色
 
