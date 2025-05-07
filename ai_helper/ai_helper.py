@@ -617,6 +617,21 @@ class AIAssistantView(ttk.Frame):
             self._text_area.insert(tk.END, content + "\n", ("user_message",))
         # 助理消息的初始 "Assistant:\n" 由 _send_message 處理
         # 助理消息的內容（Markdown）由 _check_queue 在 stream_end 時調用 _render_markdown 處理
+        elif role == "assistant":
+            # 這裡處理的是從歷史記錄加載的助理消息，
+            # 或者是當一個非流式的助理回應被直接放入隊列時（目前我們沒有這種情況，但為了穩健）
+            # 即時的流式助理消息的 "Assistant:\n" 標題由 _send_message 插入，
+            # 其 Markdown 內容由 _check_queue 的 stream_end 部分調用 _render_markdown 處理。
+            if not self._is_streaming: # 確保這是在歷史渲染或非流式情況下
+                self._text_area.insert(tk.END, f"\n{tr('Assistant')}:\n", ("assistant_message", "bold"))
+                self._render_markdown(content) # 渲染從歷史記錄讀取的完整內容
+                self._text_area.insert(tk.END, "\n") # 確保 Markdown 後有換行
+            else:
+                # 這是一個理論上的分支，如果 _is_streaming 為 True 但我們還是走到了這裡
+                # （例如，如果未來有一個非流的助理回應類型）。
+                # 目前，即時的流式助理消息的文本塊由 stream_chunk 處理，
+                # 最終的 Markdown 渲染由 stream_end 處理。
+                logger.warning("Unexpected assistant message render during _is_streaming=True in _render_message")
 
         self._text_area.configure(state="disabled")
         if not self._is_streaming : # 只有在非流式更新時才滾動，避免流式時頻繁滾動
