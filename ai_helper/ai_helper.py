@@ -212,6 +212,8 @@ class AIAssistantView(ttk.Frame):
         self._conversation_history: List[Dict[str, str]] = []
         self._current_ai_response = ""
         self._markdown = None
+        self._current_ai_response_accumulator = "" # 用於累積流式回應以供最終 Markdown 渲染
+        self._is_streaming = False # 標記是否正在流式處理
         if MarkdownIt:
             self._markdown = MarkdownIt() # Initialize Markdown parser
         self._cancel_requested = False # <--- 新增這個標誌
@@ -339,9 +341,15 @@ class AIAssistantView(ttk.Frame):
         self._input_var.set("")
         self._input_entry.configure(state="disabled")
         self._send_button.configure(state="disabled")
-        self._text_area.see(tk.END) # Scroll down
+        
+        # 在開始流之前，先顯示 "Assistant:" 標題
+        self._text_area.configure(state="normal")
+        self._text_area.insert(tk.END, f"\n{tr('Assistant')}:\n", ("assistant_message", "bold"))
+        self._text_area.configure(state="disabled")
+        self._text_area.see(tk.END)
 
-        self._cancel_requested = False # <--- 重設取消標誌
+        self._current_ai_response_accumulator = "" # 重置累加器
+        self._is_streaming = True # 開始流式處理
 
         # Start background API call
         thread = threading.Thread(target=self._call_api_thread, args=(api_url, api_key, model), daemon=True)
@@ -445,16 +453,15 @@ class AIAssistantView(ttk.Frame):
 
         full_response_content = ""
         try:
-            logger.debug("Sending API request to %s with model %s", chat_url, model)
-            logger.debug("payload: %s", payload)
+            logger.debug("Sending API request to %s with model %s and messages: %s", chat_url, model, messages_to_send)
             with requests.post(chat_url, headers=headers, json=payload, stream=True, timeout=120) as response:
                 response.raise_for_status()
+                is_first_chunk = True
                 for line in response.iter_lines():
-                    # if self._message_queue.get("cancelled", False): # Check for cancellation
-                    if self._cancel_requested:                     # <--- 改成檢查這個標誌
-                        logger.info("API call cancelled by user.")
-                        self._message_queue.put({"type": "cancelled"})
-                        return
+                    if self._cancel_requested:
+                         logger.info("API call cancelled.")
+                         self._message_queue.put({"type": "stream_end", "cancelled": True})
+                         return
 
                     if line:
                         decoded_line = line.decode('utf-8')
@@ -467,64 +474,153 @@ class AIAssistantView(ttk.Frame):
                                 delta = chunk.get('choices', [{}])[0].get('delta', {})
                                 content_part = delta.get('content')
                                 if content_part:
-                                    full_response_content += content_part
-                                    # No UI update here, accumulate first
+                                    # 直接將塊放入隊列
+                                    self._message_queue.put({"type": "stream_chunk", "content": content_part})
+                                    self._current_ai_response_accumulator += content_part # 同時累積
+                                    if is_first_chunk:
+                                        # 可能用於 UI 指示流已開始
+                                        is_first_chunk = False
                             except json.JSONDecodeError:
                                 logger.warning(f"Could not decode stream JSON: {json_str}")
-                                continue # Ignore malformed lines
-                        elif decoded_line.strip(): # Handle potential non-event stream lines / errors
+                                continue
+                        elif decoded_line.strip():
                              logger.warning(f"Received unexpected line from stream: {decoded_line}")
-
-
-            logger.debug("API stream finished.")
-            if full_response_content:
-                 self._message_queue.put({"type": "response", "content": full_response_content})
-            else:
-                 # Handle cases where the stream finishes without content (e.g., API errors before stream starts properly)
-                 logger.warning("API stream finished but no content was received.")
-                 self._message_queue.put({"type": "error", "content": tr("Received an empty response from the AI.")})
-
+            
+            # 流結束
+            self._message_queue.put({"type": "stream_end", "cancelled": False})
 
         except requests.exceptions.RequestException as e:
             logger.error(f"API request failed: {e}", exc_info=True)
             self._message_queue.put({"type": "error", "content": f"{tr('API request failed')}: {e}"})
+            self._message_queue.put({"type": "stream_end", "cancelled": False}) # 確保流結束狀態
         except Exception as e:
              logger.error(f"An unexpected error occurred during API call: {e}", exc_info=True)
              self._message_queue.put({"type": "error", "content": f"{tr('An unexpected error occurred')}: {e}"})
+             self._message_queue.put({"type": "stream_end", "cancelled": False}) # 確保流結束狀態
 
     def _check_queue(self):
         try:
             message = self._message_queue.get_nowait()
-            if message["type"] == "response":
+            
+            if message["type"] == "stream_chunk":
+                self._text_area.configure(state="normal")
+                self._text_area.insert(tk.END, message["content"]) # 直接附加原始文本
+                self._text_area.configure(state="disabled")
+                self._text_area.see(tk.END)
+
+            elif message["type"] == "stream_end":
+                self._is_streaming = False
                 self._input_entry.configure(state="normal")
                 self._send_button.configure(state="normal")
-                assistant_response = message["content"]
-                self._add_message_to_history("assistant", assistant_response)
-                self._render_message("assistant", assistant_response)
-                self._current_ai_response = "" # Clear accumulator
+                
+                if not message.get("cancelled", False) and self._current_ai_response_accumulator:
+                    # 流結束且未被取消，並且有內容
+                    # 1. 將累積的完整回應加入歷史
+                    self._add_message_to_history("assistant", self._current_ai_response_accumulator)
+                    
+                    # 2. 重新渲染最後一條助理消息 (包含 Markdown)
+                    # 找到 "Assistant:" 標籤的開始位置
+                    # 這需要更精確地定位最後一條助理消息的開始位置，而不僅僅是 "Assistant:"
+                    # 一個簡化的方法是記住 "Assistant:" 標題插入的位置
+                    # 或者，更健壯的方法是在_send_message中記錄插入"Assistant:"標題時的索引
+                    
+                    # 為了簡化，我們先假設我們可以刪除自上次 "Assistant:" 之後的所有內容，然後重新渲染
+                    # (這在併發或快速連續的助理消息時可能有問題，但對於單一聊天流應該可以)
+                    self._text_area.configure(state="normal")
+                    
+                    # --- 尋找並刪除上次的原始流式文本 ---
+                    # 我們需要找到最後一個 "Assistant:\n" (帶有 "assistant_message" 和 "bold" 標籤)
+                    # 然後刪除從那之後到文本末尾的所有內容
+                    last_assistant_prompt_indices = list(self._text_area.tag_ranges("assistant_message"))
+                    if last_assistant_prompt_indices:
+                        # 獲取最後一個 "Assistant:" 標籤的結束位置 (即其實際文本開始的位置)
+                        # tag_ranges 返回 (start1, end1, start2, end2, ...)
+                        # 我們假設 "Assistant:\n" 是單獨插入並帶有這些標籤的
+                        # 實際上，"bold" 標籤可能更精確，如果 "Assistant:" 是用 "bold" 標註的
+                        
+                        # 尋找最後一個 "Assistant:\n" 後面的文本開始位置
+                        # 一個更簡單的方法是，在 _send_message 中當我們插入 "Assistant:\n" 時，
+                        # 記錄下那個位置之後的索引。
+                        # 假設我們有一個 self._last_assistant_message_start_index
+                        # self._text_area.delete(self._last_assistant_message_start_index, tk.END)
+                        
+                        # 更簡單但粗略的方法：假設用戶訊息和助理訊息總是交替出現
+                        # 並且在流開始前已經插入了 "Assistant:\n"
+                        # 我們需要刪除自那個 "Assistant:\n" 之後的流式原始文本
+                        
+                        # 改進方法：在流式輸出之前，我們插入了 "Assistant:\n"
+                        # 當流結束時，我們知道 _current_ai_response_accumulator 是完整的內容
+                        # 我們需要找到剛才流式添加的原始文本部分並替換它。
+                        
+                        # 找到最後一個 "\nAssistant:\n" 的位置
+                        search_pattern = f"\n{tr('Assistant')}:\n"
+                        start_of_last_assistant_block = self._text_area.search(search_pattern, "1.0", tk.END, backwards=True, regexp=False)
+
+                        if start_of_last_assistant_block:
+                            # 定位到該模式之後的文本開始位置
+                            start_of_raw_stream = f"{start_of_last_assistant_block}+{len(search_pattern)}c"
+                            logger.debug(f"Attempting to delete from {start_of_raw_stream} for Markdown re-render.")
+                            self._text_area.delete(start_of_raw_stream, tk.END)
+                            self._render_markdown(self._current_ai_response_accumulator)
+                        else:
+                            # 找不到標記，直接追加渲染後的 (可能是首次或錯誤情況)
+                            logger.warning("Could not find assistant prompt marker for re-rendering. Appending.")
+                            self._render_markdown(self._current_ai_response_accumulator)
+                    else:
+                         # 找不到標籤，直接追加渲染後的
+                         logger.warning("No assistant_message tag found for re-rendering. Appending.")
+                         self._render_markdown(self._current_ai_response_accumulator)
+
+
+                    self._text_area.insert(tk.END, "\n") # 確保 Markdown 後有換行
+                    self._text_area.configure(state="disabled")
+                    self._text_area.see(tk.END)
+                
+                self._current_ai_response_accumulator = "" # 清空累加器
+
             elif message["type"] == "error":
+                self._is_streaming = False # 確保流狀態結束
                 self._input_entry.configure(state="normal")
                 self._send_button.configure(state="normal")
                 self._render_message("error", message["content"], is_error=True)
-                self._current_ai_response = "" # Clear accumulator
-            elif message["type"] == "cancelled":
-                 self._input_entry.configure(state="normal")
-                 self._send_button.configure(state="normal")
-                 self._current_ai_response = "" # Clear accumulator
-                 # Optionally display a "Cancelled" message
+                self._current_ai_response_accumulator = ""
 
         except queue.Empty:
             pass
         except Exception as e:
             logger.error(f"Error processing message queue: {e}", exc_info=True)
-            # Ensure UI is re-enabled even if queue processing fails
+            self._is_streaming = False # 確保流狀態結束
             if self._input_entry and self._input_entry.winfo_exists():
                  self._input_entry.configure(state="normal")
             if self._send_button and self._send_button.winfo_exists():
                  self._send_button.configure(state="normal")
 
-        self.after(100, self._check_queue) # Continue polling
+        self.after(100, self._check_queue)
 
+    # _render_message 方法不需要大改，因為它現在主要處理用戶消息和錯誤，
+    # 或者在流結束後由 _check_queue 調用 _render_markdown 來處理助理消息。
+    # 我們需要確保 _render_message 在流式處理期間不會被意外調用來顯示助理消息。
+
+    def _render_message(self, role: str, content: str, is_error: bool = False):
+        # 此方法現在主要用於用戶消息和錯誤，或者作為流結束後 Markdown 渲染的入口
+        if self._is_streaming and role == "assistant" and not is_error:
+            # 如果正在流式處理助理消息，則不應在此處整體渲染
+            logger.debug("_render_message called for assistant during stream, skipping full render.")
+            return
+
+        self._text_area.configure(state="normal")
+        if is_error:
+             self._text_area.insert(tk.END, f"\n{tr('Error')}:\n", ("error_message",)) # 加個換行
+             self._text_area.insert(tk.END, content + "\n", ("error_message",))
+        elif role == "user":
+            self._text_area.insert(tk.END, f"\n{tr('You')}:\n", ("user_message", "bold")) # 加個換行
+            self._text_area.insert(tk.END, content + "\n", ("user_message",))
+        # 助理消息的初始 "Assistant:\n" 由 _send_message 處理
+        # 助理消息的內容（Markdown）由 _check_queue 在 stream_end 時調用 _render_markdown 處理
+
+        self._text_area.configure(state="disabled")
+        if not self._is_streaming : # 只有在非流式更新時才滾動，避免流式時頻繁滾動
+            self._text_area.see(tk.END)
 
     def _render_markdown(self, md_text: str):
         if not self._markdown:
